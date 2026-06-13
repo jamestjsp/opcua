@@ -69,7 +69,36 @@ func BenchmarkGopcuaEncode(b *testing.B) {
 
 // BenchmarkAwcullenEncode encodes typical payload to a mock network connection.
 func BenchmarkAwcullenEncode(b *testing.B) {
-	pr := &awcullen.PublishResponse{
+	pr := newAwcullenPublishResponse()
+	ec := awcullen.NewEncodingContext()
+	conn := &MockWriter{}
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		enc := awcullen.NewBinaryEncoder(conn, ec)
+		if err := enc.Encode(pr); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAwcullenEncodeWriter(b *testing.B) {
+	pr := newAwcullenPublishResponse()
+	ec := awcullen.NewEncodingContext()
+	buf := make([]byte, 1024)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		writer := awcullen.NewWriter(buf)
+		enc := awcullen.NewBinaryEncoder(writer, ec)
+		if err := enc.Encode(pr); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func newAwcullenPublishResponse() *awcullen.PublishResponse {
+	return &awcullen.PublishResponse{
 		ResponseHeader: awcullen.ResponseHeader{
 			Timestamp:     time.Date(1601, time.January, 01, 12, 0, 0, 0, time.UTC),
 			RequestHandle: 1000085,
@@ -94,16 +123,6 @@ func BenchmarkAwcullenEncode(b *testing.B) {
 		},
 		Results:         []awcullen.StatusCode{0},
 		DiagnosticInfos: []awcullen.DiagnosticInfo{},
-	}
-	ec := awcullen.NewEncodingContext()
-	conn := &MockWriter{}
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		enc := awcullen.NewBinaryEncoder(conn, ec)
-		if err := enc.Encode(pr); err != nil {
-			b.Fatal(err)
-		}
 	}
 }
 

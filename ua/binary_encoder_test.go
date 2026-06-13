@@ -542,6 +542,36 @@ func TestStruct(t *testing.T) {
 	}
 }
 
+func TestWriteExtensionObjectWithWriterMatchesFallback(t *testing.T) {
+	in := ua.DataChangeNotification{
+		MonitoredItems: []ua.MonitoredItemNotification{
+			{
+				ClientHandle: 9,
+				Value: ua.DataValue{
+					Value:           3.14159,
+					SourceTimestamp: time.Date(1601, time.January, 1, 12, 0, 0, 0, time.UTC),
+					ServerTimestamp: time.Date(1601, time.January, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+		},
+		DiagnosticInfos: []ua.DiagnosticInfo{},
+	}
+
+	fallback := &bytes.Buffer{}
+	fallbackEnc := ua.NewBinaryEncoder(fallback, ua.NewEncodingContext())
+	if err := fallbackEnc.WriteExtensionObject(in); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := ua.NewWriter(make([]byte, 1024))
+	writerEnc := ua.NewBinaryEncoder(writer, ua.NewEncodingContext())
+	if err := writerEnc.WriteExtensionObject(in); err != nil {
+		t.Fatal(err)
+	}
+
+	assert.DeepEqual(t, writer.Bytes(), fallback.Bytes())
+}
+
 func TestSliceBoolean(t *testing.T) {
 	cases := []struct {
 		in    []bool
