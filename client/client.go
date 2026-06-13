@@ -67,7 +67,7 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 	}
 	var res *ua.GetEndpointsResponse
 	if reverseListener != nil {
-		res, err = getEndpointsReverse(ctx, req, reverseListener, endpointURL, cli.connectTimeout)
+		res, err = getEndpointsReverse(ctx, req, reverseListener, endpointURL, cli.reverseConnectServerURIs, cli.connectTimeout)
 	} else {
 		res, err = GetEndpoints(ctx, req)
 	}
@@ -158,7 +158,7 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		cli.trace)
 
 	if reverseListener != nil {
-		conn, err := acceptReverse(ctx, reverseListener, endpointURL, cli.connectTimeout)
+		conn, err := acceptReverse(ctx, reverseListener, endpointURL, cli.reverseConnectServerURIs, cli.connectTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -211,6 +211,7 @@ type Client struct {
 	maxMessageSize                       uint32
 	maxChunkCount                        uint32
 	reverseConnectURL                    string
+	reverseConnectServerURIs             []string
 	trace                                bool
 }
 

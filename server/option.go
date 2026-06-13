@@ -113,6 +113,16 @@ func WithReverseConnectClientURLs(urls []string, interval time.Duration) Option 
 	}
 }
 
+// WithReverseConnectRejectTimeout sets how long to wait before retrying a client URL that rejects ReverseHello.
+func WithReverseConnectRejectTimeout(value time.Duration) Option {
+	return func(srv *Server) error {
+		if value > 0 {
+			srv.reverseConnectRejectTimeout = value
+		}
+		return nil
+	}
+}
+
 // WithServerDiagnostics sets whether to enable the collection of data used for ServerDiagnostics node.
 func WithServerDiagnostics(value bool) Option {
 	return func(opts *Server) error {

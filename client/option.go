@@ -227,6 +227,14 @@ func WithReverseConnectURL(value string) Option {
 	}
 }
 
+// WithReverseConnectServerURIs limits reverse connections to servers with matching ApplicationURI values.
+func WithReverseConnectServerURIs(values []string) Option {
+	return func(c *Client) error {
+		c.reverseConnectServerURIs = append(c.reverseConnectServerURIs[:0], values...)
+		return nil
+	}
+}
+
 // WithTrace logs all ServiceRequests and ServiceResponses to StdOut.
 func WithTrace() Option {
 	return func(c *Client) error {

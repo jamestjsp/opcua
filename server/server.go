@@ -65,6 +65,10 @@ type Server struct {
 	maxWorkerThreads                     int
 	reverseConnectURLs                   []string
 	reverseConnectInterval               time.Duration
+	reverseConnectRejectTimeout          time.Duration
+	reverseConnectMu                     sync.Mutex
+	reverseConnectActive                 map[string]int
+	reverseConnectRejectedUntil          map[string]time.Time
 	serverDiagnostics                    bool
 	trace                                bool
 	localCertificate                     []byte
@@ -113,6 +117,9 @@ func New(localDescription ua.ApplicationDescription, certPath, keyPath, endpoint
 		maxChunkCount:                      defaultMaxChunkCount,
 		maxWorkerThreads:                   defaultMaxWorkerThreads,
 		reverseConnectInterval:             5 * time.Second,
+		reverseConnectRejectTimeout:        time.Minute,
+		reverseConnectActive:               make(map[string]int),
+		reverseConnectRejectedUntil:        make(map[string]time.Time),
 		serverDiagnostics:                  true,
 		trace:                              false,
 		closing:                            make(chan struct{}),
@@ -427,9 +434,10 @@ func (srv *Server) handleConnection(conn net.Conn, wg *sync.WaitGroup) {
 	// log.Printf("Success closing secure channel '%d'.\n", ch.channelID)
 }
 
-func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup) {
+func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup, clientURL string) {
 	defer conn.Close()
 	defer wg.Done()
+	defer srv.endReverseConnect(clientURL)
 	ch := newServerSecureChannel(srv, conn, srv.trace)
 	closing := make(chan struct{})
 	defer close(closing)
@@ -445,6 +453,7 @@ func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup) {
 	}
 	err := ch.Open()
 	if err != nil {
+		srv.rejectReverseConnect(clientURL, err)
 		if c, ok := err.(ua.StatusCode); ok {
 			ch.Abort(c, "")
 		}

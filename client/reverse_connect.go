@@ -18,6 +18,11 @@ type deadlineListener interface {
 	SetDeadline(time.Time) error
 }
 
+type reverseHello struct {
+	serverURI   string
+	endpointURL string
+}
+
 func listenReverse(reverseURL string) (net.Listener, error) {
 	u, err := url.Parse(reverseURL)
 	if err != nil {
@@ -26,7 +31,7 @@ func listenReverse(reverseURL string) (net.Listener, error) {
 	return net.Listen("tcp", u.Host)
 }
 
-func getEndpointsReverse(ctx context.Context, request *ua.GetEndpointsRequest, ln net.Listener, endpointURL string, connectTimeout int64) (*ua.GetEndpointsResponse, error) {
+func getEndpointsReverse(ctx context.Context, request *ua.GetEndpointsRequest, ln net.Listener, endpointURL string, serverURIs []string, connectTimeout int64) (*ua.GetEndpointsResponse, error) {
 	ch := newClientSecureChannel(
 		ua.ApplicationDescription{
 			ApplicationName: ua.LocalizedText{Text: "DiscoveryClient"},
@@ -56,7 +61,7 @@ func getEndpointsReverse(ctx context.Context, request *ua.GetEndpointsRequest, l
 		defaultMaxChunkCount,
 		false,
 	)
-	conn, err := acceptReverse(ctx, ln, endpointURL, connectTimeout)
+	conn, err := acceptReverse(ctx, ln, endpointURL, serverURIs, connectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +84,7 @@ func getEndpointsReverse(ctx context.Context, request *ua.GetEndpointsRequest, l
 	return res, nil
 }
 
-func acceptReverse(ctx context.Context, ln net.Listener, endpointURL string, connectTimeout int64) (net.Conn, error) {
+func acceptReverse(ctx context.Context, ln net.Listener, endpointURL string, serverURIs []string, connectTimeout int64) (net.Conn, error) {
 	deadline := time.Now().Add(time.Duration(connectTimeout) * time.Millisecond)
 	if t, ok := ctx.Deadline(); ok && t.Before(deadline) {
 		deadline = t
@@ -98,7 +103,8 @@ func acceptReverse(ctx context.Context, ln net.Listener, endpointURL string, con
 				return nil, err
 			}
 		}
-		if err := readReverseHello(conn, endpointURL, deadline); err != nil {
+		if err := validateReverseHello(conn, endpointURL, serverURIs, deadline); err != nil {
+			_ = writeReverseReject(conn, err)
 			conn.Close()
 			if time.Now().After(deadline) {
 				return nil, err
@@ -110,37 +116,68 @@ func acceptReverse(ctx context.Context, ln net.Listener, endpointURL string, con
 	}
 }
 
-func readReverseHello(conn net.Conn, endpointURL string, deadline time.Time) error {
+func validateReverseHello(conn net.Conn, endpointURL string, serverURIs []string, deadline time.Time) error {
+	hello, err := readReverseHello(conn, deadline)
+	if err != nil {
+		return err
+	}
+	if hello.endpointURL != endpointURL {
+		return ua.BadTCPMessageTypeInvalid
+	}
+	if len(serverURIs) == 0 {
+		return nil
+	}
+	for _, serverURI := range serverURIs {
+		if hello.serverURI == serverURI {
+			return nil
+		}
+	}
+	return ua.BadTCPMessageTypeInvalid
+}
+
+func readReverseHello(conn net.Conn, deadline time.Time) (reverseHello, error) {
 	_ = conn.SetReadDeadline(deadline)
 	var header [8]byte
 	if _, err := io.ReadFull(conn, header[:]); err != nil {
-		return err
+		return reverseHello{}, err
 	}
 	if binary.LittleEndian.Uint32(header[:4]) != ua.MessageTypeReverseHello {
-		return ua.BadDecodingError
+		return reverseHello{}, ua.BadTCPMessageTypeInvalid
 	}
 	msgLen := binary.LittleEndian.Uint32(header[4:8])
 	if msgLen < 16 || msgLen > defaultMaxBufferSize {
-		return ua.BadDecodingError
+		return reverseHello{}, ua.BadDecodingError
 	}
 	buf := make([]byte, msgLen)
 	copy(buf, header[:])
 	if _, err := io.ReadFull(conn, buf[8:]); err != nil {
-		return err
+		return reverseHello{}, err
 	}
 
 	reader := bytes.NewReader(buf[8:])
 	dec := ua.NewBinaryDecoder(reader, ua.NewEncodingContext())
 	var serverURI string
 	if err := dec.ReadString(&serverURI); err != nil {
-		return ua.BadDecodingError
+		return reverseHello{}, ua.BadDecodingError
 	}
 	var reverseEndpointURL string
 	if err := dec.ReadString(&reverseEndpointURL); err != nil {
-		return ua.BadDecodingError
+		return reverseHello{}, ua.BadDecodingError
 	}
-	if reverseEndpointURL != endpointURL {
-		return ua.BadTCPEndpointURLInvalid
+	return reverseHello{serverURI: serverURI, endpointURL: reverseEndpointURL}, nil
+}
+
+func writeReverseReject(conn net.Conn, reason error) error {
+	code, ok := reason.(ua.StatusCode)
+	if !ok {
+		code = ua.BadTCPMessageTypeInvalid
 	}
-	return nil
+	var buf [16]byte
+	binary.LittleEndian.PutUint32(buf[0:4], ua.MessageTypeError)
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(16))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(code))
+	binary.LittleEndian.PutUint32(buf[12:16], 0xFFFFFFFF)
+	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	_, err := conn.Write(buf[:])
+	return err
 }

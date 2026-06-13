@@ -250,6 +250,20 @@ func (ch *serverSecureChannel) Open() error {
 		}
 		// log.Printf("-> Hello { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", remoteProtocolVersion, remoteReceiveBufferSize, remoteSendBufferSize, remoteMaxMessageSize, remoteMaxChunkCount, ch.endpointURL)
 
+	case ua.MessageTypeError:
+		if msgLen < 16 {
+			return ua.BadDecodingError
+		}
+		var remoteCode uint32
+		if err := dec.ReadUInt32(&remoteCode); err != nil {
+			return ua.BadDecodingError
+		}
+		var unused string
+		if err = dec.ReadString(&unused); err != nil {
+			return ua.BadDecodingError
+		}
+		return ua.StatusCode(remoteCode)
+
 	default:
 		return ua.BadDecodingError
 	}
