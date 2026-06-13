@@ -12,7 +12,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/djherbis/buffer"
 	"github.com/google/uuid"
 )
 
@@ -47,6 +46,18 @@ type sliceHeader struct {
 	data unsafe.Pointer
 	len  int
 	cap  int
+}
+
+type writeAtBuffer interface {
+	io.Writer
+	io.WriterAt
+	Len() int
+}
+
+type writeAtBuffer64 interface {
+	io.Writer
+	io.WriterAt
+	Len() int64
 }
 
 // BinaryEncoder encodes the UA Binary protocol.
@@ -789,35 +800,40 @@ func (enc *BinaryEncoder) WriteExtensionObject(value ExtensionObject) error {
 	if err := enc.WriteByte(0x01); err != nil {
 		return BadEncodingError
 	}
-	// cast writer to BufferAt to access superpowers
-	if buf, ok := enc.w.(buffer.BufferAt); ok {
-		mark := buf.Len() // mark where length is written
-		bs := make([]byte, 4)
-		if _, err := buf.Write(bs); err != nil {
-			return BadEncodingError
-		}
-		start := buf.Len() // mark where encoding starts
-		if err := enc.Encode(value); err != nil {
-			return BadEncodingError
-		}
-		end := buf.Len() // mark where encoding ends
-		binary.LittleEndian.PutUint32(bs, uint32(end-start))
-		// write actual length at mark
-		if _, err := buf.WriteAt(bs, mark); err != nil {
-			return BadEncodingError
-		}
-		return nil
+	switch buf := enc.w.(type) {
+	case writeAtBuffer:
+		return enc.writeExtensionObjectBodyWithLength(value, buf, func() int64 { return int64(buf.Len()) })
+	case writeAtBuffer64:
+		return enc.writeExtensionObjectBodyWithLength(value, buf, buf.Len)
 	}
 
 	// fall back to using extra buffer
-	buf2 := *(bytesPool.Get().(*[]byte))
-	defer bytesPool.Put(&buf2)
-	var writer = NewWriter(buf2)
-	enc2 := NewBinaryEncoder(writer, enc.ec)
+	buf2 := bytesPool.Get().(*[]byte)
+	defer bytesPool.Put(buf2)
+	writer := Writer{s: *buf2}
+	enc2 := BinaryEncoder{w: &writer, ec: enc.ec}
 	if err := enc2.Encode(value); err != nil {
 		return BadEncodingError
 	}
 	if err := enc.WriteByteArray(writer.Bytes()); err != nil {
+		return BadEncodingError
+	}
+	return nil
+}
+
+func (enc *BinaryEncoder) writeExtensionObjectBodyWithLength(value ExtensionObject, buf io.WriterAt, lenFn func() int64) error {
+	mark := lenFn()
+	binary.LittleEndian.PutUint32(enc.bs[:4], 0)
+	if _, err := enc.w.Write(enc.bs[:4]); err != nil {
+		return BadEncodingError
+	}
+	start := lenFn()
+	if err := enc.Encode(value); err != nil {
+		return BadEncodingError
+	}
+	end := lenFn()
+	binary.LittleEndian.PutUint32(enc.bs[:4], uint32(end-start))
+	if _, err := buf.WriteAt(enc.bs[:4], mark); err != nil {
 		return BadEncodingError
 	}
 	return nil
