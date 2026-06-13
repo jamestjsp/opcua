@@ -65,6 +65,7 @@ type Server struct {
 	maxWorkerThreads                     int
 	reverseConnectURLs                   []string
 	reverseConnectInterval               time.Duration
+	reverseConnectTimeout                time.Duration
 	reverseConnectRejectTimeout          time.Duration
 	reverseConnectMu                     sync.Mutex
 	reverseConnectActive                 map[string]int
@@ -117,6 +118,7 @@ func New(localDescription ua.ApplicationDescription, certPath, keyPath, endpoint
 		maxChunkCount:                      defaultMaxChunkCount,
 		maxWorkerThreads:                   defaultMaxWorkerThreads,
 		reverseConnectInterval:             5 * time.Second,
+		reverseConnectTimeout:              3 * time.Second,
 		reverseConnectRejectTimeout:        time.Minute,
 		reverseConnectActive:               make(map[string]int),
 		reverseConnectRejectedUntil:        make(map[string]time.Time),

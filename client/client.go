@@ -13,7 +13,6 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"os"
 	"sort"
 
@@ -51,13 +50,21 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		}
 	}
 
-	var reverseListener net.Listener
+	var reverseManager = cli.reverseConnectManager
+	if cli.reverseConnectURL != "" && reverseManager != nil {
+		return nil, ua.BadInvalidArgument
+	}
 	if cli.reverseConnectURL != "" {
-		reverseListener, err = listenReverse(cli.reverseConnectURL)
+		timeout := reverseConnectDuration(cli.connectTimeout)
+		reverseManager, err = NewReverseConnectManager(
+			cli.reverseConnectURL,
+			WithReverseConnectHoldTime(timeout),
+			WithReverseConnectWaitTimeout(timeout),
+		)
 		if err != nil {
 			return nil, err
 		}
-		defer reverseListener.Close()
+		defer reverseManager.Close()
 	}
 
 	// get endpoints from discovery url
@@ -66,8 +73,8 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		ProfileURIs: []string{ua.TransportProfileURIUaTcpTransport},
 	}
 	var res *ua.GetEndpointsResponse
-	if reverseListener != nil {
-		res, err = getEndpointsReverse(ctx, req, reverseListener, endpointURL, cli.reverseConnectServerURIs, cli.connectTimeout)
+	if reverseManager != nil {
+		res, err = getEndpointsReverse(ctx, req, reverseManager, endpointURL, cli.reverseConnectServerURIs, cli.connectTimeout)
 	} else {
 		res, err = GetEndpoints(ctx, req)
 	}
@@ -157,8 +164,8 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		cli.maxChunkCount,
 		cli.trace)
 
-	if reverseListener != nil {
-		conn, err := acceptReverse(ctx, reverseListener, endpointURL, cli.reverseConnectServerURIs, cli.connectTimeout)
+	if reverseManager != nil {
+		conn, err := reverseManager.Wait(ctx, endpointURL, cli.reverseConnectServerURIs)
 		if err != nil {
 			return nil, err
 		}
@@ -212,6 +219,7 @@ type Client struct {
 	maxChunkCount                        uint32
 	reverseConnectURL                    string
 	reverseConnectServerURIs             []string
+	reverseConnectManager                *ReverseConnectManager
 	trace                                bool
 }
 

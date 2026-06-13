@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"net"
 	"net/url"
 	"sync"
@@ -12,7 +13,21 @@ import (
 )
 
 func (srv *Server) reverseConnect(wg *sync.WaitGroup) {
-	srv.reverseConnectOnce(wg)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		close(done)
+		cancel()
+	}()
+	go func() {
+		select {
+		case <-srv.closing:
+			cancel()
+		case <-done:
+		}
+	}()
+
+	srv.reverseConnectOnce(ctx, wg)
 	ticker := time.NewTicker(srv.reverseConnectInterval)
 	defer ticker.Stop()
 	for {
@@ -20,14 +35,14 @@ func (srv *Server) reverseConnect(wg *sync.WaitGroup) {
 		case <-srv.closing:
 			return
 		case <-ticker.C:
-			srv.reverseConnectOnce(wg)
+			srv.reverseConnectOnce(ctx, wg)
 		}
 	}
 }
 
-func (srv *Server) reverseConnectOnce(wg *sync.WaitGroup) {
-	timeout := srv.reverseConnectInterval
-	if timeout <= 0 || timeout > 3*time.Second {
+func (srv *Server) reverseConnectOnce(ctx context.Context, wg *sync.WaitGroup) {
+	timeout := srv.reverseConnectTimeout
+	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
 	for _, clientURL := range srv.reverseConnectURLs {
@@ -43,7 +58,9 @@ func (srv *Server) reverseConnectOnce(wg *sync.WaitGroup) {
 		if !srv.beginReverseConnect(clientURL) {
 			continue
 		}
-		conn, err := net.DialTimeout("tcp", u.Host, timeout)
+		dialCtx, cancel := context.WithTimeout(ctx, timeout)
+		conn, err := new(net.Dialer).DialContext(dialCtx, "tcp", u.Host)
+		cancel()
 		if err != nil {
 			srv.endReverseConnect(clientURL)
 			continue

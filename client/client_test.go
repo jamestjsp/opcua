@@ -54,10 +54,26 @@ func TestMain(m *testing.M) {
 				os.Exit(3)
 			}
 		}()
+		if err := waitForTestServer(endpointURL, 5*time.Second); err != nil {
+			fmt.Println(errors.Wrap(err, "Error starting server"))
+			os.Exit(3)
+		}
 	}
 	// run the tests
 	res := m.Run()
 	defer os.Exit(res)
+}
+
+func waitForTestServer(endpointURL string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, err := client.FindServers(context.Background(), &ua.FindServersRequest{EndpointURL: endpointURL})
+		if err == nil {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return ua.BadTimeout
 }
 
 // TestDiscoveryClient discovers connection information about a server.
@@ -170,6 +186,73 @@ func TestReverseConnectWithSecurity(t *testing.T) {
 	if err := ch.Close(ctx); err != nil {
 		ch.Abort(ctx)
 		t.Fatal(errors.Wrap(err, "Error closing secure reverse connect client"))
+	}
+}
+
+func TestReverseConnectWithSharedManager(t *testing.T) {
+	serverURL := freeEndpointURL(t)
+	reverseURL := freeEndpointURL(t)
+
+	mgr, err := client.NewReverseConnectManager(reverseURL)
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error constructing reverse connect manager"))
+	}
+
+	srv, err := NewTestServerAt(serverURL, server.WithReverseConnectClientURLs([]string{reverseURL}, 25*time.Millisecond))
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error constructing reverse connect server"))
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+	defer func() {
+		if err := srv.Close(); err != nil {
+			t.Error(errors.Wrap(err, "Error closing reverse connect server"))
+		}
+		if err := <-errCh; err != ua.BadServerHalted {
+			t.Error(errors.Wrap(err, "Error stopping reverse connect server"))
+		}
+	}()
+	defer mgr.Close()
+
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ch, err := client.Dial(
+		ctx,
+		serverURL,
+		client.WithReverseConnectManager(mgr),
+		client.WithInsecureSkipVerify(),
+	)
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error connecting to server by shared reverse connect manager"))
+	}
+	if ch.EndpointURL() != serverURL {
+		t.Fatalf("expected endpoint URL %q, got %q", serverURL, ch.EndpointURL())
+	}
+	if err := ch.Close(ctx); err != nil {
+		ch.Abort(ctx)
+		t.Fatal(errors.Wrap(err, "Error closing reverse connect client"))
+	}
+}
+
+func TestReverseConnectURLAndManagerAreMutuallyExclusive(t *testing.T) {
+	reverseURL := freeEndpointURL(t)
+	mgr, err := client.NewReverseConnectManager(reverseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	_, err = client.Dial(
+		context.Background(),
+		"opc.tcp://127.0.0.1:4840",
+		client.WithReverseConnectURL(reverseURL),
+		client.WithReverseConnectManager(mgr),
+	)
+	if err != ua.BadInvalidArgument {
+		t.Fatalf("expected %v, got %v", ua.BadInvalidArgument, err)
 	}
 }
 

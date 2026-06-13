@@ -235,6 +235,14 @@ func WithReverseConnectServerURIs(values []string) Option {
 	}
 }
 
+// WithReverseConnectManager uses manager to wait for incoming reverse connections.
+func WithReverseConnectManager(manager *ReverseConnectManager) Option {
+	return func(c *Client) error {
+		c.reverseConnectManager = manager
+		return nil
+	}
+}
+
 // WithTrace logs all ServiceRequests and ServiceResponses to StdOut.
 func WithTrace() Option {
 	return func(c *Client) error {

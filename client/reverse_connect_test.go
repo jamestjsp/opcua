@@ -68,6 +68,106 @@ func TestAcceptReverseRejectsEndpointMismatchWithError(t *testing.T) {
 	}
 }
 
+func TestReverseConnectManagerHoldsIncomingConnection(t *testing.T) {
+	reverseURL := freeReverseConnectURL(t)
+	mgr, err := NewReverseConnectManager(
+		reverseURL,
+		WithReverseConnectHoldTime(time.Second),
+		WithReverseConnectWaitTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	endpointURL := "opc.tcp://127.0.0.1:4840"
+	remote := dialReverseHello(t, mgr, "urn:server", endpointURL)
+	defer remote.Close()
+
+	time.Sleep(25 * time.Millisecond)
+	ctx, cancel := timeContext(time.Second)
+	defer cancel()
+	conn, err := mgr.Wait(ctx, endpointURL, []string{"urn:server"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := remote.Write([]byte{0x7f}); err != nil {
+		t.Fatal(err)
+	}
+	var buf [1]byte
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 0x7f {
+		t.Fatalf("expected 0x7f, got 0x%x", buf[0])
+	}
+}
+
+func TestReverseConnectManagerMatchesEndpointAndServerURI(t *testing.T) {
+	reverseURL := freeReverseConnectURL(t)
+	mgr, err := NewReverseConnectManager(
+		reverseURL,
+		WithReverseConnectHoldTime(time.Second),
+		WithReverseConnectWaitTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	remoteA := dialReverseHello(t, mgr, "urn:a", "opc.tcp://127.0.0.1:4840")
+	defer remoteA.Close()
+	remoteB := dialReverseHello(t, mgr, "urn:b", "opc.tcp://127.0.0.1:4841")
+	defer remoteB.Close()
+
+	ctx, cancel := timeContext(time.Second)
+	defer cancel()
+	conn, err := mgr.Wait(ctx, "opc.tcp://127.0.0.1:4841", []string{"urn:b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := remoteB.Write([]byte{0x42}); err != nil {
+		t.Fatal(err)
+	}
+	var buf [1]byte
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 0x42 {
+		t.Fatalf("expected 0x42, got 0x%x", buf[0])
+	}
+}
+
+func TestReverseConnectManagerRejectsUnclaimedConnectionAfterHoldTime(t *testing.T) {
+	reverseURL := freeReverseConnectURL(t)
+	mgr, err := NewReverseConnectManager(
+		reverseURL,
+		WithReverseConnectHoldTime(25*time.Millisecond),
+		WithReverseConnectWaitTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	remote := dialReverseHello(t, mgr, "urn:server", "opc.tcp://127.0.0.1:4840")
+	defer remote.Close()
+	_ = remote.SetReadDeadline(time.Now().Add(time.Second))
+	code, err := readTestErrorCode(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != ua.BadTCPMessageTypeInvalid {
+		t.Fatalf("expected %v, got %v", ua.BadTCPMessageTypeInvalid, code)
+	}
+}
+
 func BenchmarkReadReverseHello(b *testing.B) {
 	msg := testReverseHelloBytes("urn:server", "opc.tcp://127.0.0.1:4840")
 	deadline := time.Now().Add(time.Hour)
@@ -107,6 +207,17 @@ func BenchmarkWriteReverseReject(b *testing.B) {
 	}
 }
 
+func BenchmarkReverseConnectionMatches(b *testing.B) {
+	rc := &reverseConnection{serverURI: "urn:server", endpointURL: "opc.tcp://127.0.0.1:4840"}
+	serverURIs := []string{"urn:other", "urn:server"}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if !reverseConnectionMatches(rc, "opc.tcp://127.0.0.1:4840", serverURIs) {
+			b.Fatal("expected match")
+		}
+	}
+}
+
 func writeTestReverseHello(t *testing.T, conn net.Conn, serverURI, endpointURL string) {
 	t.Helper()
 	buf := testReverseHelloBytes(serverURI, endpointURL)
@@ -137,6 +248,29 @@ func readTestErrorCode(conn net.Conn) (ua.StatusCode, error) {
 		return 0, ua.BadTCPMessageTypeInvalid
 	}
 	return ua.StatusCode(binary.LittleEndian.Uint32(buf[8:12])), nil
+}
+
+func freeReverseConnectURL(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return "opc.tcp://" + addr
+}
+
+func dialReverseHello(t *testing.T, mgr *ReverseConnectManager, serverURI, endpointURL string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", mgr.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestReverseHello(t, conn, serverURI, endpointURL)
+	return conn
 }
 
 func timeContext(timeout time.Duration) (context.Context, context.CancelFunc) {
