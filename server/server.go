@@ -63,6 +63,8 @@ type Server struct {
 	maxMessageSize                       uint32
 	maxChunkCount                        uint32
 	maxWorkerThreads                     int
+	reverseConnectURLs                   []string
+	reverseConnectInterval               time.Duration
 	serverDiagnostics                    bool
 	trace                                bool
 	localCertificate                     []byte
@@ -110,6 +112,7 @@ func New(localDescription ua.ApplicationDescription, certPath, keyPath, endpoint
 		maxMessageSize:                     defaultMaxMessageSize,
 		maxChunkCount:                      defaultMaxChunkCount,
 		maxWorkerThreads:                   defaultMaxWorkerThreads,
+		reverseConnectInterval:             5 * time.Second,
 		serverDiagnostics:                  true,
 		trace:                              false,
 		closing:                            make(chan struct{}),
@@ -310,7 +313,19 @@ func (srv *Server) ListenAndServe() error {
 	}()
 
 	var wg sync.WaitGroup
+	var reverseDone chan struct{}
+	if len(srv.reverseConnectURLs) > 0 {
+		reverseDone = make(chan struct{})
+		go func() {
+			srv.reverseConnect(&wg)
+			close(reverseDone)
+		}()
+	}
 	err = srv.serve(ln, &wg)
+
+	if reverseDone != nil {
+		<-reverseDone
+	}
 
 	// wait until channels closed
 	wg.Wait()
@@ -410,6 +425,32 @@ func (srv *Server) handleConnection(conn net.Conn, wg *sync.WaitGroup) {
 		return
 	}
 	// log.Printf("Success closing secure channel '%d'.\n", ch.channelID)
+}
+
+func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup) {
+	defer conn.Close()
+	defer wg.Done()
+	ch := newServerSecureChannel(srv, conn, srv.trace)
+	closing := make(chan struct{})
+	defer close(closing)
+	go func() {
+		select {
+		case <-srv.closing:
+			ch.Close()
+		case <-closing:
+		}
+	}()
+	if err := ch.writeReverseHello(); err != nil {
+		return
+	}
+	err := ch.Open()
+	if err != nil {
+		if c, ok := err.(ua.StatusCode); ok {
+			ch.Abort(c, "")
+		}
+		return
+	}
+	_ = srv.requestWorker(ch)
 }
 
 // requestWorker receives service requests from channel and processes them.

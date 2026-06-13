@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/awcullen/opcua/client"
+	"github.com/awcullen/opcua/server"
 	"github.com/awcullen/opcua/ua"
 
 	"github.com/pkg/errors"
@@ -86,6 +87,60 @@ func TestDiscoveryClient(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestReverseConnectWithoutSecurity(t *testing.T) {
+	serverURL := freeEndpointURL(t)
+	reverseURL := freeEndpointURL(t)
+
+	srv, err := NewTestServerAt(serverURL, server.WithReverseConnectClientURLs([]string{reverseURL}, 25*time.Millisecond))
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error constructing reverse connect server"))
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+	defer func() {
+		if err := srv.Close(); err != nil {
+			t.Error(errors.Wrap(err, "Error closing reverse connect server"))
+		}
+		if err := <-errCh; err != ua.BadServerHalted {
+			t.Error(errors.Wrap(err, "Error stopping reverse connect server"))
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ch, err := client.Dial(
+		ctx,
+		serverURL,
+		client.WithReverseConnectURL(reverseURL),
+		client.WithInsecureSkipVerify(),
+	)
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error connecting to server by reverse connect"))
+	}
+	if ch.EndpointURL() != serverURL {
+		t.Fatalf("expected endpoint URL %q, got %q", serverURL, ch.EndpointURL())
+	}
+	if err := ch.Close(ctx); err != nil {
+		ch.Abort(ctx)
+		t.Fatal(errors.Wrap(err, "Error closing reverse connect client"))
+	}
+}
+
+func freeEndpointURL(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return "opc.tcp://" + addr
 }
 
 // TestOpenClientlWithoutSecurity tests opening a connection with a server using no security.

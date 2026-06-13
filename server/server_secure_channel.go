@@ -179,6 +179,24 @@ func (ch *serverSecureChannel) IsExpired() bool {
 	return time.Now().After(ch.tokenExpiration)
 }
 
+func (ch *serverSecureChannel) writeReverseHello() error {
+	buf := *(ch.bytesPool.Get().(*[]byte))
+	defer ch.bytesPool.Put(&buf)
+	writer := ua.NewWriter(buf)
+	enc := ua.NewBinaryEncoder(writer, ua.NewEncodingContext())
+	serverURI := ch.srv.localDescription.ApplicationURI
+	enc.WriteUInt32(ua.MessageTypeReverseHello)
+	enc.WriteUInt32(uint32(16 + len(serverURI) + len(ch.srv.endpointURL)))
+	enc.WriteString(serverURI)
+	enc.WriteString(ch.srv.endpointURL)
+	ch.conn.SetWriteDeadline(time.Now().Add(3000 * time.Millisecond))
+	if _, err := ch.write(writer.Bytes()); err != nil {
+		return ua.BadEncodingError
+	}
+	ch.conn.SetWriteDeadline(time.Time{})
+	return nil
+}
+
 // Open the secure channel to the remote endpoint.
 func (ch *serverSecureChannel) Open() error {
 	ch.Lock()

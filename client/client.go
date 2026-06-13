@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 
@@ -50,12 +51,26 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		}
 	}
 
+	var reverseListener net.Listener
+	if cli.reverseConnectURL != "" {
+		reverseListener, err = listenReverse(cli.reverseConnectURL)
+		if err != nil {
+			return nil, err
+		}
+		defer reverseListener.Close()
+	}
+
 	// get endpoints from discovery url
 	req := &ua.GetEndpointsRequest{
 		EndpointURL: endpointURL,
 		ProfileURIs: []string{ua.TransportProfileURIUaTcpTransport},
 	}
-	res, err := GetEndpoints(ctx, req)
+	var res *ua.GetEndpointsResponse
+	if reverseListener != nil {
+		res, err = getEndpointsReverse(ctx, req, reverseListener, endpointURL, cli.connectTimeout)
+	} else {
+		res, err = GetEndpoints(ctx, req)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +157,14 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		cli.maxChunkCount,
 		cli.trace)
 
+	if reverseListener != nil {
+		conn, err := acceptReverse(ctx, reverseListener, endpointURL, cli.connectTimeout)
+		if err != nil {
+			return nil, err
+		}
+		cli.channel.conn = conn
+	}
+
 	// open session and read the namespace table
 	if err := cli.open(ctx); err != nil {
 		cli.Abort(ctx)
@@ -187,6 +210,7 @@ type Client struct {
 	maxBufferSize                        uint32
 	maxMessageSize                       uint32
 	maxChunkCount                        uint32
+	reverseConnectURL                    string
 	trace                                bool
 }
 

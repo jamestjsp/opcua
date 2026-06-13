@@ -218,6 +218,15 @@ func WithConnectTimeout(value int64) Option {
 	}
 }
 
+// WithReverseConnectURL listens at the given client URL and waits for the server to initiate the TCP connection.
+// The URL is in the form opc.tcp://[host]:[port].
+func WithReverseConnectURL(value string) Option {
+	return func(c *Client) error {
+		c.reverseConnectURL = value
+		return nil
+	}
+}
+
 // WithTrace logs all ServiceRequests and ServiceResponses to StdOut.
 func WithTrace() Option {
 	return func(c *Client) error {

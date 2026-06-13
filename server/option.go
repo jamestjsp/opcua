@@ -2,7 +2,11 @@
 
 package server
 
-import "github.com/awcullen/opcua/ua"
+import (
+	"time"
+
+	"github.com/awcullen/opcua/ua"
+)
 
 // Option is a functional option to be applied to a server during initialization.
 type Option func(*Server) error
@@ -93,6 +97,18 @@ func WithTransportLimits(maxBufferSize, maxMessageSize, maxChunkCount uint32) Op
 func WithMaxWorkerThreads(value int) Option {
 	return func(opts *Server) error {
 		opts.maxWorkerThreads = value
+		return nil
+	}
+}
+
+// WithReverseConnectClientURLs sets the client URLs that the server connects to for reverse connections.
+// The interval controls how often the server retries the configured client URLs.
+func WithReverseConnectClientURLs(urls []string, interval time.Duration) Option {
+	return func(srv *Server) error {
+		srv.reverseConnectURLs = append(srv.reverseConnectURLs[:0], urls...)
+		if interval > 0 {
+			srv.reverseConnectInterval = interval
+		}
 		return nil
 	}
 }
