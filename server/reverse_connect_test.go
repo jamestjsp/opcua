@@ -35,3 +35,36 @@ func TestReverseConnectStateSkipsActiveAndRejectedClientURLs(t *testing.T) {
 		t.Fatal("expected reverse connect attempt after reject timeout")
 	}
 }
+
+func BenchmarkBeginReverseConnect(b *testing.B) {
+	srv := &Server{
+		reverseConnectRejectTimeout: time.Minute,
+		reverseConnectActive:        make(map[string]int),
+		reverseConnectRejectedUntil: make(map[string]time.Time),
+	}
+	clientURL := "opc.tcp://127.0.0.1:4840"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if !srv.beginReverseConnect(clientURL) {
+			b.Fatal("expected reverse connect to start")
+		}
+		srv.endReverseConnect(clientURL)
+	}
+}
+
+func BenchmarkBeginReverseConnectRejected(b *testing.B) {
+	srv := &Server{
+		reverseConnectRejectTimeout: time.Minute,
+		reverseConnectActive:        make(map[string]int),
+		reverseConnectRejectedUntil: map[string]time.Time{
+			"opc.tcp://127.0.0.1:4840": time.Now().Add(time.Minute),
+		},
+	}
+	clientURL := "opc.tcp://127.0.0.1:4840"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if srv.beginReverseConnect(clientURL) {
+			b.Fatal("expected reverse connect to back off")
+		}
+	}
+}

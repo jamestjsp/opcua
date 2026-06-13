@@ -3,24 +3,28 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
 	"net"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/awcullen/opcua/ua"
 )
 
+var reverseHelloBufferPool = sync.Pool{New: func() any {
+	buf := make([]byte, defaultMaxBufferSize)
+	return &buf
+}}
+
+var reverseRejectBufferPool = sync.Pool{New: func() any {
+	return new([16]byte)
+}}
+
 type deadlineListener interface {
 	SetDeadline(time.Time) error
-}
-
-type reverseHello struct {
-	serverURI   string
-	endpointURL string
 }
 
 func listenReverse(reverseURL string) (net.Listener, error) {
@@ -117,54 +121,85 @@ func acceptReverse(ctx context.Context, ln net.Listener, endpointURL string, ser
 }
 
 func validateReverseHello(conn net.Conn, endpointURL string, serverURIs []string, deadline time.Time) error {
-	hello, err := readReverseHello(conn, deadline)
+	serverURI, reverseEndpointURL, bufp, err := readReverseHello(conn, deadline)
+	if bufp != nil {
+		defer reverseHelloBufferPool.Put(bufp)
+	}
 	if err != nil {
 		return err
 	}
-	if hello.endpointURL != endpointURL {
+	if !equalBytesString(reverseEndpointURL, endpointURL) {
 		return ua.BadTCPMessageTypeInvalid
 	}
 	if len(serverURIs) == 0 {
 		return nil
 	}
-	for _, serverURI := range serverURIs {
-		if hello.serverURI == serverURI {
+	for _, expectedServerURI := range serverURIs {
+		if equalBytesString(serverURI, expectedServerURI) {
 			return nil
 		}
 	}
 	return ua.BadTCPMessageTypeInvalid
 }
 
-func readReverseHello(conn net.Conn, deadline time.Time) (reverseHello, error) {
+func readReverseHello(conn net.Conn, deadline time.Time) ([]byte, []byte, *[]byte, error) {
 	_ = conn.SetReadDeadline(deadline)
 	var header [8]byte
 	if _, err := io.ReadFull(conn, header[:]); err != nil {
-		return reverseHello{}, err
+		return nil, nil, nil, err
 	}
 	if binary.LittleEndian.Uint32(header[:4]) != ua.MessageTypeReverseHello {
-		return reverseHello{}, ua.BadTCPMessageTypeInvalid
+		return nil, nil, nil, ua.BadTCPMessageTypeInvalid
 	}
 	msgLen := binary.LittleEndian.Uint32(header[4:8])
 	if msgLen < 16 || msgLen > defaultMaxBufferSize {
-		return reverseHello{}, ua.BadDecodingError
+		return nil, nil, nil, ua.BadDecodingError
 	}
-	buf := make([]byte, msgLen)
-	copy(buf, header[:])
-	if _, err := io.ReadFull(conn, buf[8:]); err != nil {
-		return reverseHello{}, err
+	bodyLen := int(msgLen - 8)
+	bufp := reverseHelloBufferPool.Get().(*[]byte)
+	buf := (*bufp)[:bodyLen]
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		reverseHelloBufferPool.Put(bufp)
+		return nil, nil, nil, err
 	}
 
-	reader := bytes.NewReader(buf[8:])
-	dec := ua.NewBinaryDecoder(reader, ua.NewEncodingContext())
-	var serverURI string
-	if err := dec.ReadString(&serverURI); err != nil {
-		return reverseHello{}, ua.BadDecodingError
+	serverURI, n, err := readReverseHelloString(buf)
+	if err != nil {
+		reverseHelloBufferPool.Put(bufp)
+		return nil, nil, nil, err
 	}
-	var reverseEndpointURL string
-	if err := dec.ReadString(&reverseEndpointURL); err != nil {
-		return reverseHello{}, ua.BadDecodingError
+	reverseEndpointURL, _, err := readReverseHelloString(buf[n:])
+	if err != nil {
+		reverseHelloBufferPool.Put(bufp)
+		return nil, nil, nil, err
 	}
-	return reverseHello{serverURI: serverURI, endpointURL: reverseEndpointURL}, nil
+	return serverURI, reverseEndpointURL, bufp, nil
+}
+
+func readReverseHelloString(buf []byte) ([]byte, int, error) {
+	if len(buf) < 4 {
+		return nil, 0, ua.BadDecodingError
+	}
+	n := int(int32(binary.LittleEndian.Uint32(buf[:4])))
+	if n < 0 {
+		return nil, 4, nil
+	}
+	if n > len(buf)-4 {
+		return nil, 0, ua.BadDecodingError
+	}
+	return buf[4 : 4+n], 4 + n, nil
+}
+
+func equalBytesString(value []byte, expected string) bool {
+	if len(value) != len(expected) {
+		return false
+	}
+	for i, b := range value {
+		if expected[i] != b {
+			return false
+		}
+	}
+	return true
 }
 
 func writeReverseReject(conn net.Conn, reason error) error {
@@ -172,12 +207,14 @@ func writeReverseReject(conn net.Conn, reason error) error {
 	if !ok {
 		code = ua.BadTCPMessageTypeInvalid
 	}
-	var buf [16]byte
+	bufp := reverseRejectBufferPool.Get().(*[16]byte)
+	defer reverseRejectBufferPool.Put(bufp)
+	buf := bufp[:]
 	binary.LittleEndian.PutUint32(buf[0:4], ua.MessageTypeError)
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(16))
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(code))
 	binary.LittleEndian.PutUint32(buf[12:16], 0xFFFFFFFF)
 	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
-	_, err := conn.Write(buf[:])
+	_, err := conn.Write(buf)
 	return err
 }
