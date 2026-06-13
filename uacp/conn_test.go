@@ -7,6 +7,7 @@ package uacp
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -22,15 +23,21 @@ func TestConn(t *testing.T) {
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	errCh := make(chan error, 1)
 	go func() {
 		defer ln.Close()
 		if _, err := ln.Accept(ctx); err != nil {
-			t.Fatal(err)
+			errCh <- err
+			return
 		}
+		errCh <- nil
 	}()
 
 	if _, err = Dial(ctx, ep); err != nil {
 		t.Error(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -46,13 +53,17 @@ func TestClientWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var cliConn, srvConn *Conn
+	var cliConn *Conn
+	srvConnCh := make(chan *Conn, 1)
+	errCh := make(chan error, 1)
 	go func() {
 		defer ln.Close()
-		srvConn, err = ln.Accept(ctx)
+		srvConn, err := ln.Accept(ctx)
 		if err != nil {
-			t.Fatal(err)
+			errCh <- err
+			return
 		}
+		srvConnCh <- srvConn
 	}()
 
 	cliConn, err = Dial(ctx, ep)
@@ -62,21 +73,24 @@ func TestClientWrite(t *testing.T) {
 
 	buf := make([]byte, 1024)
 	expected := []byte{0xde, 0xad, 0xbe, 0xef}
-	for {
-		if srvConn != nil {
-			if _, err := cliConn.Write(expected); err != nil {
-				t.Fatal(err)
-			}
-			n, err := srvConn.Read(buf)
-			if err != nil {
-				t.Fatal(err)
-			}
+	var srvConn *Conn
+	select {
+	case srvConn = <-srvConnCh:
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server connection")
+	}
+	if _, err := cliConn.Write(expected); err != nil {
+		t.Fatal(err)
+	}
+	n, err := srvConn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			if diff := cmp.Diff(buf[:n], expected); diff != "" {
-				t.Error(diff)
-			}
-			break
-		}
+	if diff := cmp.Diff(buf[:n], expected); diff != "" {
+		t.Error(diff)
 	}
 }
 
@@ -92,13 +106,17 @@ func TestServerWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var cliConn, srvConn *Conn
+	var cliConn *Conn
+	srvConnCh := make(chan *Conn, 1)
+	errCh := make(chan error, 1)
 	go func() {
 		defer ln.Close()
-		srvConn, err = ln.Accept(ctx)
+		srvConn, err := ln.Accept(ctx)
 		if err != nil {
-			t.Fatal(err)
+			errCh <- err
+			return
 		}
+		srvConnCh <- srvConn
 	}()
 
 	cliConn, err = Dial(ctx, ep)
@@ -108,21 +126,24 @@ func TestServerWrite(t *testing.T) {
 
 	buf := make([]byte, 1024)
 	expected := []byte{0xde, 0xad, 0xbe, 0xef}
-	for {
-		if srvConn != nil {
-			if _, err := srvConn.Write(expected); err != nil {
-				t.Fatal(err)
-			}
-			n, err := cliConn.Read(buf)
-			if err != nil {
-				t.Fatal(err)
-			}
+	var srvConn *Conn
+	select {
+	case srvConn = <-srvConnCh:
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server connection")
+	}
+	if _, err := srvConn.Write(expected); err != nil {
+		t.Fatal(err)
+	}
+	n, err := cliConn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			if diff := cmp.Diff(buf[:n], expected); diff != "" {
-				t.Error(diff)
-			}
-			break
-		}
+	if diff := cmp.Diff(buf[:n], expected); diff != "" {
+		t.Error(diff)
 	}
 }
 func TestConnGetState(t *testing.T) {

@@ -7,6 +7,7 @@ package uacp
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 
 	"github.com/wmnsk/gopcua/utils"
@@ -52,12 +53,13 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 	var err error
 
 	conn := &Conn{
-		state:     srvStateClosed,
-		stateChan: make(chan state),
-		lenChan:   make(chan int),
-		errChan:   make(chan error),
-		rcvBuf:    make([]byte, l.rcvBufSize),
-		lep:       l.endpoint,
+		state:       srvStateClosed,
+		stateChan:   make(chan state, 1),
+		payloadChan: make(chan []byte, 16),
+		errChan:     make(chan error, 1),
+		done:        make(chan struct{}),
+		rcvBuf:      make([]byte, l.rcvBufSize),
+		lep:         l.endpoint,
 	}
 	conn.lowerConn, err = l.lowerListener.Accept()
 	if err != nil {
@@ -95,7 +97,7 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 		}
 	}
 
-	conn.state = srvStateEstablished
+	conn.setState(srvStateEstablished)
 	go conn.monitorMessages(ctx)
 	for {
 		select {
@@ -107,7 +109,16 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 				continue
 			}
 		case err := <-conn.errChan:
+			conn.Close()
 			return nil, err
+		case <-ctx.Done():
+			conn.Close()
+			return nil, ctx.Err()
+		case <-conn.done:
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, io.EOF
 		}
 	}
 }

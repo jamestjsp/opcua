@@ -6,6 +6,7 @@ package uacp
 
 import (
 	"context"
+	"io"
 	"net"
 	"time"
 
@@ -37,12 +38,13 @@ func dial(ctx context.Context, endpoint string, interval time.Duration, maxRetry
 	}
 
 	conn := &Conn{
-		state:     cliStateClosed,
-		stateChan: make(chan state),
-		lenChan:   make(chan int),
-		errChan:   make(chan error),
-		rcvBuf:    make([]byte, 0xffff),
-		rep:       endpoint,
+		state:       cliStateClosed,
+		stateChan:   make(chan state, 1),
+		payloadChan: make(chan []byte, 16),
+		errChan:     make(chan error, 1),
+		done:        make(chan struct{}),
+		rcvBuf:      make([]byte, 0xffff),
+		rep:         endpoint,
 	}
 	conn.lowerConn, err = net.Dial(network, raddr.String())
 	if err != nil {
@@ -57,6 +59,7 @@ func dial(ctx context.Context, endpoint string, interval time.Duration, maxRetry
 	go conn.monitorMessages(ctx)
 	for {
 		if sent > maxRetry {
+			conn.Close()
 			return nil, ErrTimeout
 		}
 
@@ -69,9 +72,19 @@ func dial(ctx context.Context, endpoint string, interval time.Duration, maxRetry
 				continue
 			}
 		case err := <-conn.errChan:
+			conn.Close()
 			return nil, err
+		case <-ctx.Done():
+			conn.Close()
+			return nil, ctx.Err()
+		case <-conn.done:
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, io.EOF
 		case <-time.After(interval):
 			if err := conn.Hello(); err != nil {
+				conn.Close()
 				return nil, err
 			}
 			sent++
