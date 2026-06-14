@@ -16,22 +16,23 @@ func TestReverseConnectStateSkipsActiveAndRejectedClientURLs(t *testing.T) {
 		reverseConnectRejectedUntil: make(map[string]time.Time),
 	}
 	clientURL := "opc.tcp://127.0.0.1:4840"
+	now := time.Now()
 
-	if !srv.beginReverseConnect(clientURL) {
+	if !srv.beginReverseConnect(clientURL, now) {
 		t.Fatal("expected first reverse connect attempt to start")
 	}
-	if srv.beginReverseConnect(clientURL) {
+	if srv.beginReverseConnect(clientURL, now) {
 		t.Fatal("expected active reverse connect attempt to block duplicate attempts")
 	}
 
 	srv.rejectReverseConnect(clientURL, ua.BadTCPMessageTypeInvalid)
 	srv.endReverseConnect(clientURL)
-	if srv.beginReverseConnect(clientURL) {
+	if srv.beginReverseConnect(clientURL, now) {
 		t.Fatal("expected rejected reverse connect attempt to back off")
 	}
 
 	srv.reverseConnectRejectedUntil[clientURL] = time.Now().Add(-time.Second)
-	if !srv.beginReverseConnect(clientURL) {
+	if !srv.beginReverseConnect(clientURL, now) {
 		t.Fatal("expected reverse connect attempt after reject timeout")
 	}
 }
@@ -43,9 +44,10 @@ func BenchmarkBeginReverseConnect(b *testing.B) {
 		reverseConnectRejectedUntil: make(map[string]time.Time),
 	}
 	clientURL := "opc.tcp://127.0.0.1:4840"
+	now := time.Now()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if !srv.beginReverseConnect(clientURL) {
+		if !srv.beginReverseConnect(clientURL, now) {
 			b.Fatal("expected reverse connect to start")
 		}
 		srv.endReverseConnect(clientURL)
@@ -61,9 +63,10 @@ func BenchmarkBeginReverseConnectRejected(b *testing.B) {
 		},
 	}
 	clientURL := "opc.tcp://127.0.0.1:4840"
+	now := time.Now()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if srv.beginReverseConnect(clientURL) {
+		if srv.beginReverseConnect(clientURL, now) {
 			b.Fatal("expected reverse connect to back off")
 		}
 	}

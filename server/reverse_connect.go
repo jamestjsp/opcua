@@ -45,6 +45,7 @@ func (srv *Server) reverseConnectOnce(ctx context.Context, wg *sync.WaitGroup) {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
+	now := time.Now()
 	for _, clientURL := range srv.reverseConnectURLs {
 		select {
 		case <-srv.closing:
@@ -55,7 +56,7 @@ func (srv *Server) reverseConnectOnce(ctx context.Context, wg *sync.WaitGroup) {
 		if err != nil {
 			continue
 		}
-		if !srv.beginReverseConnect(clientURL) {
+		if !srv.beginReverseConnect(clientURL, now) {
 			continue
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -70,13 +71,13 @@ func (srv *Server) reverseConnectOnce(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func (srv *Server) beginReverseConnect(clientURL string) bool {
+func (srv *Server) beginReverseConnect(clientURL string, now time.Time) bool {
 	srv.reverseConnectMu.Lock()
 	defer srv.reverseConnectMu.Unlock()
 	if srv.reverseConnectActive[clientURL] > 0 {
 		return false
 	}
-	if until := srv.reverseConnectRejectedUntil[clientURL]; time.Now().Before(until) {
+	if until := srv.reverseConnectRejectedUntil[clientURL]; now.Before(until) {
 		return false
 	}
 	srv.reverseConnectActive[clientURL]++
