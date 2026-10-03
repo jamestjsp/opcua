@@ -11,7 +11,13 @@ import (
 	"github.com/awcullen/opcua/ua"
 )
 
-const maxReverseHelloStringLength = 4096
+const (
+	maxReverseHelloStringLength = 4096
+	reverseConnectMinRedialAge  = time.Second
+)
+
+// helloTimeout is how long an incoming connection may wait for Hello and OpenSecureChannel.
+var helloTimeout = 20 * time.Second
 
 // reverseConnectTarget tracks the sockets the server holds open to one reverse connect client.
 type reverseConnectTarget struct {

@@ -115,7 +115,7 @@ func newServerSecureChannel(srv *Server, conn net.Conn, trace bool) *serverSecur
 		securityPolicy:        new(ua.SecurityPolicyNone),
 		localCertificate:      srv.localCertificate,
 		localPrivateKey:       srv.localPrivateKey,
-		tokenExpiration:       time.Now().Add(20 * time.Second),
+		tokenExpiration:       time.Now().Add(helloTimeout),
 	}
 	return ch
 }
@@ -254,6 +254,11 @@ func (ch *serverSecureChannel) Open() error {
 		}
 		if err := dec.ReadString(&ch.endpointURL); err != nil {
 			return ua.BadDecodingError
+		}
+		if ch.tokenExpiration.IsZero() {
+			// reverse sockets wait for Hello without a deadline; bound the rest of Open.
+			ch.tokenExpiration = time.Now().Add(helloTimeout)
+			ch.conn.SetDeadline(ch.tokenExpiration)
 		}
 		// log.Printf("-> Hello { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", remoteProtocolVersion, remoteReceiveBufferSize, remoteSendBufferSize, remoteMaxMessageSize, remoteMaxChunkCount, ch.endpointURL)
 

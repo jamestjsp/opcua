@@ -441,9 +441,17 @@ func (srv *Server) handleConnection(conn net.Conn, wg *sync.WaitGroup) {
 func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup, t *reverseConnectTarget) {
 	defer wg.Done()
 	defer conn.Close()
-	established := false
-	defer func() { srv.endReverseConnect(t, established) }()
+	start := time.Now()
+	established, redial := false, false
+	defer func() {
+		srv.endReverseConnect(t, established)
+		if redial {
+			srv.kickReverseConnect()
+		}
+	}()
 	ch := newServerSecureChannel(srv, conn, srv.trace)
+	// Part 6 requires the server to keep this socket open until the client sends Hello.
+	ch.tokenExpiration = time.Time{}
 	closing := make(chan struct{})
 	defer close(closing)
 	go func() {
@@ -458,11 +466,16 @@ func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup, t 
 		return
 	}
 	if err := ch.Open(); err != nil {
-		if _, ok := err.(remoteError); ok {
+		if code, ok := err.(remoteError); ok {
+			log.Printf("Reverse connect to %s rejected. %s\n", t.host, ua.StatusCode(code))
 			srv.rejectReverseConnect(t, time.Now())
-		} else if c, ok := err.(ua.StatusCode); ok {
+			return
+		}
+		if c, ok := err.(ua.StatusCode); ok {
 			ch.Abort(c, "")
 		}
+		// replace a waiting socket the client dropped, unless it drops them immediately.
+		redial = time.Since(start) >= reverseConnectMinRedialAge
 		return
 	}
 	established = true

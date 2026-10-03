@@ -24,25 +24,27 @@ var reverseRejectBufferPool = sync.Pool{New: func() any {
 	return new([16]byte)
 }}
 
+// badServerTooBusy is Bad_ServerTooBusy, which Part 6 §7.1.3 requires; ua predates it.
+const badServerTooBusy ua.StatusCode = 0x80EE0000
+
 const (
-	defaultReverseConnectHoldTime    = 15 * time.Second
-	maxReverseConnectHoldTime        = 19 * time.Second
-	defaultReverseConnectWaitTimeout = 20 * time.Second
-	defaultReverseConnectMaxPending  = 64
-	maxReverseHelloTimeout           = 10 * time.Second
-	maxReverseHelloStringLength      = 4096
-	maxReverseHelloSize              = 16 + 2*(maxReverseHelloStringLength-1)
+	defaultReverseConnectWaitTimeout  = 20 * time.Second
+	defaultReverseConnectMaxPending   = 64
+	defaultReverseConnectHelloTimeout = 10 * time.Second
+	maxReverseHelloStringLength       = 4096
+	maxReverseHelloSize               = 16 + 2*(maxReverseHelloStringLength-1)
 )
 
 // ReverseConnectManager accepts ReverseHello messages and holds matching connections for clients.
 // A shared manager keeps the listener open between dial attempts, so the socket a server keeps
 // waiting for the client is available immediately.
 type ReverseConnectManager struct {
-	endpointURL string
-	ln          net.Listener
-	holdTime    time.Duration
-	waitTimeout time.Duration
-	maxPending  int
+	endpointURL  string
+	ln           net.Listener
+	holdTime     time.Duration
+	helloTimeout time.Duration
+	waitTimeout  time.Duration
+	maxPending   int
 
 	closeOnce sync.Once
 	wg        sync.WaitGroup
@@ -65,16 +67,29 @@ type reverseConnection struct {
 	conn        net.Conn
 	serverURI   string
 	endpointURL string
-	timer       *time.Timer
+	monitor     sync.WaitGroup
+	err         error
+	probe       [1]byte
 }
 
-// WithReverseConnectHoldTime sets how long incoming ReverseHello sockets are held for a client.
-// The value is capped at 19s, below the server's 20s Hello timeout, so held sockets stay usable.
+// WithReverseConnectHoldTime limits how long an unclaimed ReverseHello socket is held.
+// By default sockets are held until claimed or closed by the server.
 func WithReverseConnectHoldTime(value time.Duration) ReverseConnectManagerOption {
 	return func(m *ReverseConnectManager) error {
 		if value > 0 {
-			m.holdTime = min(value, maxReverseConnectHoldTime)
+			m.holdTime = value
 		}
+		return nil
+	}
+}
+
+// WithReverseConnectHelloTimeout sets how long an incoming socket may wait for ReverseHello before it is closed. (default: 10s)
+func WithReverseConnectHelloTimeout(value time.Duration) ReverseConnectManagerOption {
+	return func(m *ReverseConnectManager) error {
+		if value <= 0 {
+			return ua.BadInvalidArgument
+		}
+		m.helloTimeout = value
 		return nil
 	}
 }
@@ -90,7 +105,7 @@ func WithReverseConnectWaitTimeout(value time.Duration) ReverseConnectManagerOpt
 }
 
 // WithReverseConnectMaxPending sets how many incoming sockets may be held or awaiting ReverseHello.
-// Further sockets are rejected with Bad_TcpServerTooBusy. The default is 64.
+// Further sockets are rejected with Bad_ServerTooBusy. The default is 64.
 func WithReverseConnectMaxPending(value int) ReverseConnectManagerOption {
 	return func(m *ReverseConnectManager) error {
 		if value > 0 {
@@ -107,14 +122,14 @@ func NewReverseConnectManager(reverseURL string, opts ...ReverseConnectManagerOp
 		return nil, err
 	}
 	m := &ReverseConnectManager{
-		endpointURL: reverseURL,
-		ln:          ln,
-		holdTime:    defaultReverseConnectHoldTime,
-		waitTimeout: defaultReverseConnectWaitTimeout,
-		maxPending:  defaultReverseConnectMaxPending,
-		notify:      make(chan struct{}),
-		closing:     make(chan struct{}),
-		closed:      make(chan struct{}),
+		endpointURL:  reverseURL,
+		ln:           ln,
+		helloTimeout: defaultReverseConnectHelloTimeout,
+		waitTimeout:  defaultReverseConnectWaitTimeout,
+		maxPending:   defaultReverseConnectMaxPending,
+		notify:       make(chan struct{}),
+		closing:      make(chan struct{}),
+		closed:       make(chan struct{}),
 	}
 	for _, opt := range opts {
 		if err := opt(m); err != nil {
@@ -161,7 +176,6 @@ func (m *ReverseConnectManager) Close() error {
 		m.active -= len(pending)
 		m.mu.Unlock()
 		for _, rc := range pending {
-			rc.timer.Stop()
 			rc.conn.Close()
 		}
 		for _, conn := range handshaking {
@@ -191,7 +205,11 @@ func (m *ReverseConnectManager) Wait(ctx context.Context, endpointURL string, se
 	for {
 		if rc := m.takeLocked(endpointURL, serverURIs); rc != nil {
 			m.mu.Unlock()
-			return rc.conn, nil
+			if conn, err := claim(rc); err == nil {
+				return conn, nil
+			}
+			m.mu.Lock()
+			continue
 		}
 		select {
 		case <-m.closing:
@@ -244,7 +262,7 @@ func (m *ReverseConnectManager) serve() {
 		}
 		if m.active >= m.maxPending {
 			m.mu.Unlock()
-			_ = writeReverseReject(conn, ua.BadTCPServerTooBusy)
+			_ = writeReverseReject(conn, badServerTooBusy)
 			conn.Close()
 			continue
 		}
@@ -258,9 +276,14 @@ func (m *ReverseConnectManager) serve() {
 
 func (m *ReverseConnectManager) handle(conn net.Conn) {
 	defer m.wg.Done()
-	rc, err := readReverseHello(conn, time.Now().Add(min(m.holdTime, maxReverseHelloTimeout)))
+	rc, err := readReverseHello(conn, time.Now().Add(m.helloTimeout))
 	if err == nil {
-		err = conn.SetReadDeadline(time.Time{})
+		var holdDeadline time.Time
+		if m.holdTime > 0 {
+			holdDeadline = time.Now().Add(m.holdTime)
+		}
+		// set before the socket is visible to Wait, so claim's deadline always wins.
+		err = conn.SetReadDeadline(holdDeadline)
 	}
 	m.mu.Lock()
 	tracked := removeConn(&m.handshaking, conn)
@@ -276,14 +299,18 @@ func (m *ReverseConnectManager) handle(conn net.Conn) {
 		return
 	}
 	rc.conn = conn
-	rc.timer = time.AfterFunc(m.holdTime, func() { m.expire(rc) })
+	rc.monitor.Add(1)
 	m.pending = append(m.pending, rc)
 	m.notifyLocked()
 	m.mu.Unlock()
+	m.monitor(rc)
 }
 
-// expire closes a connection nobody claimed. Part 6 has the Client close, not reject, unwanted sockets.
-func (m *ReverseConnectManager) expire(rc *reverseConnection) {
+// monitor watches a held socket so one closed by the server, or past its hold time, is discarded.
+// The server sends nothing until Hello, so any data is a protocol violation.
+func (m *ReverseConnectManager) monitor(rc *reverseConnection) {
+	defer rc.monitor.Done()
+	n, _ := rc.conn.Read(rc.probe[:])
 	m.mu.Lock()
 	removed := false
 	for i, pending := range m.pending {
@@ -294,9 +321,33 @@ func (m *ReverseConnectManager) expire(rc *reverseConnection) {
 		}
 	}
 	m.mu.Unlock()
-	if removed {
-		rc.conn.Close()
+	if !removed {
+		if n > 0 {
+			rc.err = ua.BadTCPMessageTypeInvalid
+		}
+		return
 	}
+	if n > 0 {
+		_ = writeReverseReject(rc.conn, ua.BadTCPMessageTypeInvalid)
+	}
+	rc.conn.Close()
+}
+
+// claim stops the monitor of a socket taken from pending and returns the socket ready for Hello.
+func claim(rc *reverseConnection) (net.Conn, error) {
+	_ = rc.conn.SetReadDeadline(time.Now())
+	rc.monitor.Wait()
+	if rc.err == nil {
+		rc.err = rc.conn.SetReadDeadline(time.Time{})
+	}
+	if rc.err != nil {
+		if rc.err == ua.BadTCPMessageTypeInvalid {
+			_ = writeReverseReject(rc.conn, ua.BadTCPMessageTypeInvalid)
+		}
+		rc.conn.Close()
+		return nil, rc.err
+	}
+	return rc.conn, nil
 }
 
 func (m *ReverseConnectManager) fail(err error) {
@@ -311,7 +362,6 @@ func (m *ReverseConnectManager) fail(err error) {
 func (m *ReverseConnectManager) takeLocked(endpointURL string, serverURIs []string) *reverseConnection {
 	for i, rc := range m.pending {
 		if reverseConnectionMatches(rc, endpointURL, serverURIs) {
-			rc.timer.Stop()
 			m.removePendingLocked(i)
 			return rc
 		}

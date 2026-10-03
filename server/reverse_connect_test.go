@@ -3,10 +3,14 @@
 package server
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,6 +102,9 @@ func TestReverseConnectClientErrorBacksOff(t *testing.T) {
 	}
 	defer ln.Close()
 	clientURL := "opc.tcp://" + ln.Addr().String()
+	var logs syncBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
 	srv := newReverseTestServer(t, "urn:test:server", clientURL,
 		WithReverseConnectRejectTimeout(time.Minute))
 	srv.reverseConnectInterval = 10 * time.Millisecond
@@ -141,6 +148,80 @@ func TestReverseConnectClientErrorBacksOff(t *testing.T) {
 	if extra, err := ln.Accept(); err == nil {
 		extra.Close()
 		t.Fatal("expected server to back off after client Error message")
+	}
+	if !strings.Contains(logs.String(), "rejected") || !strings.Contains(logs.String(), ln.Addr().String()) {
+		t.Fatalf("expected client Error to be logged, got %q", logs.String())
+	}
+}
+
+func TestReverseSocketWaitsForHelloWithoutDeadline(t *testing.T) {
+	defer func(d time.Duration) { helloTimeout = d }(helloTimeout)
+	helloTimeout = 200 * time.Millisecond
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	srv := newReverseTestServer(t, "urn:test:server", "opc.tcp://"+ln.Addr().String())
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe() }()
+	defer func() {
+		srv.Close()
+		<-done
+	}()
+
+	conn := acceptReverseHello(t, ln, srv)
+	defer conn.Close()
+	time.Sleep(3 * helloTimeout)
+	if _, err := conn.Write(helloBytes(srv.endpointURL)); err != nil {
+		t.Fatal(err)
+	}
+	var ack [8]byte
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, ack[:]); err != nil {
+		t.Fatalf("expected Acknowledge after delayed Hello: %v", err)
+	}
+	if binary.LittleEndian.Uint32(ack[0:4]) != ua.MessageTypeAck {
+		t.Fatalf("expected Acknowledge, got % x", ack)
+	}
+}
+
+func TestReverseConnectRedialsWhenWaitingSocketDropped(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	// default 5s interval: only a redial explains a prompt second socket.
+	srv := newReverseTestServer(t, "urn:test:server", "opc.tcp://"+ln.Addr().String())
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe() }()
+	defer func() {
+		srv.Close()
+		<-done
+	}()
+
+	quick := acceptReverseHello(t, ln, srv)
+	quick.Close()
+	_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(500 * time.Millisecond))
+	if extra, err := ln.Accept(); err == nil {
+		extra.Close()
+		t.Fatal("expected no immediate redial after a socket dropped at once")
+	}
+
+	_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second))
+	held := acceptReverseHello(t, ln, srv)
+	time.Sleep(reverseConnectMinRedialAge + 100*time.Millisecond)
+	held.Close()
+	start := time.Now()
+	_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second))
+	next, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("expected immediate redial after a held socket dropped: %v", err)
+	}
+	next.Close()
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("expected immediate redial, took %v", d)
 	}
 }
 
@@ -225,6 +306,55 @@ func freeServerEndpointURL(t *testing.T) string {
 	}
 	defer ln.Close()
 	return "opc.tcp://" + ln.Addr().String()
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func acceptReverseHello(t *testing.T, ln net.Listener, srv *Server) net.Conn {
+	t.Helper()
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	want := reverseHelloBytes(srv.localDescription.ApplicationURI, srv.endpointURL)
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	return conn
+}
+
+func helloBytes(endpointURL string) []byte {
+	n := 32 + len(endpointURL)
+	b := make([]byte, n)
+	binary.LittleEndian.PutUint32(b[0:4], ua.MessageTypeHello)
+	binary.LittleEndian.PutUint32(b[4:8], uint32(n))
+	binary.LittleEndian.PutUint32(b[8:12], 0)
+	binary.LittleEndian.PutUint32(b[12:16], 65535)
+	binary.LittleEndian.PutUint32(b[16:20], 65535)
+	binary.LittleEndian.PutUint32(b[20:24], 0)
+	binary.LittleEndian.PutUint32(b[24:28], 0)
+	binary.LittleEndian.PutUint32(b[28:32], uint32(len(endpointURL)))
+	copy(b[32:], endpointURL)
+	return b
 }
 
 func reverseHelloBytes(serverURI, endpointURL string) []byte {
