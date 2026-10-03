@@ -16,7 +16,7 @@ import (
 )
 
 var reverseHelloBufferPool = sync.Pool{New: func() any {
-	buf := make([]byte, defaultMaxBufferSize)
+	buf := make([]byte, maxReverseHelloSize)
 	return &buf
 }}
 
@@ -26,25 +26,36 @@ var reverseRejectBufferPool = sync.Pool{New: func() any {
 
 const (
 	defaultReverseConnectHoldTime    = 15 * time.Second
+	maxReverseConnectHoldTime        = 19 * time.Second
 	defaultReverseConnectWaitTimeout = 20 * time.Second
+	defaultReverseConnectMaxPending  = 64
+	maxReverseHelloTimeout           = 10 * time.Second
+	maxReverseHelloStringLength      = 4096
+	maxReverseHelloSize              = 16 + 2*(maxReverseHelloStringLength-1)
 )
 
 // ReverseConnectManager accepts ReverseHello messages and holds matching connections for clients.
+// A shared manager keeps the listener open between dial attempts, so the socket a server keeps
+// waiting for the client is available immediately.
 type ReverseConnectManager struct {
 	endpointURL string
 	ln          net.Listener
 	holdTime    time.Duration
 	waitTimeout time.Duration
+	maxPending  int
 
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	mu      sync.Mutex
-	pending []*reverseConnection
-	notify  chan struct{}
-	closing chan struct{}
-	closed  chan struct{}
-	err     error
+	mu          sync.Mutex
+	active      int
+	handshaking []net.Conn
+	pending     []*reverseConnection
+	waiters     int
+	notify      chan struct{}
+	closing     chan struct{}
+	closed      chan struct{}
+	err         error
 }
 
 // ReverseConnectManagerOption configures a ReverseConnectManager.
@@ -54,13 +65,15 @@ type reverseConnection struct {
 	conn        net.Conn
 	serverURI   string
 	endpointURL string
+	timer       *time.Timer
 }
 
 // WithReverseConnectHoldTime sets how long incoming ReverseHello sockets are held for a client.
+// The value is capped at 19s, below the server's 20s Hello timeout, so held sockets stay usable.
 func WithReverseConnectHoldTime(value time.Duration) ReverseConnectManagerOption {
 	return func(m *ReverseConnectManager) error {
 		if value > 0 {
-			m.holdTime = value
+			m.holdTime = min(value, maxReverseConnectHoldTime)
 		}
 		return nil
 	}
@@ -76,32 +89,36 @@ func WithReverseConnectWaitTimeout(value time.Duration) ReverseConnectManagerOpt
 	}
 }
 
+// WithReverseConnectMaxPending sets how many incoming sockets may be held or awaiting ReverseHello.
+// Further sockets are rejected with Bad_TcpServerTooBusy. The default is 64.
+func WithReverseConnectMaxPending(value int) ReverseConnectManagerOption {
+	return func(m *ReverseConnectManager) error {
+		if value > 0 {
+			m.maxPending = value
+		}
+		return nil
+	}
+}
+
 // NewReverseConnectManager listens at reverseURL and accepts reverse connections.
 func NewReverseConnectManager(reverseURL string, opts ...ReverseConnectManagerOption) (*ReverseConnectManager, error) {
 	ln, err := listenReverse(reverseURL)
 	if err != nil {
 		return nil, err
 	}
-	m, err := newReverseConnectManager(reverseURL, ln, opts...)
-	if err != nil {
-		ln.Close()
-		return nil, err
-	}
-	return m, nil
-}
-
-func newReverseConnectManager(reverseURL string, ln net.Listener, opts ...ReverseConnectManagerOption) (*ReverseConnectManager, error) {
 	m := &ReverseConnectManager{
 		endpointURL: reverseURL,
 		ln:          ln,
 		holdTime:    defaultReverseConnectHoldTime,
 		waitTimeout: defaultReverseConnectWaitTimeout,
+		maxPending:  defaultReverseConnectMaxPending,
 		notify:      make(chan struct{}),
 		closing:     make(chan struct{}),
 		closed:      make(chan struct{}),
 	}
 	for _, opt := range opts {
 		if err := opt(m); err != nil {
+			ln.Close()
 			return nil, err
 		}
 	}
@@ -125,7 +142,7 @@ func (m *ReverseConnectManager) Addr() net.Addr {
 	return m.ln.Addr()
 }
 
-// Close stops the manager and rejects any held reverse connections.
+// Close stops the manager and closes any held reverse connections.
 func (m *ReverseConnectManager) Close() error {
 	if m == nil {
 		return nil
@@ -138,12 +155,17 @@ func (m *ReverseConnectManager) Close() error {
 			m.err = err
 		}
 		pending := m.pending
+		handshaking := m.handshaking
 		m.pending = nil
-		m.notifyLocked()
+		m.handshaking = nil
+		m.active -= len(pending)
 		m.mu.Unlock()
 		for _, rc := range pending {
-			_ = writeReverseReject(rc.conn, ua.BadTCPMessageTypeInvalid)
+			rc.timer.Stop()
 			rc.conn.Close()
+		}
+		for _, conn := range handshaking {
+			conn.Close()
 		}
 		m.wg.Wait()
 		close(m.closed)
@@ -155,6 +177,7 @@ func (m *ReverseConnectManager) Close() error {
 }
 
 // Wait returns a held reverse connection matching endpointURL and serverURIs.
+// Held connections are returned oldest first.
 func (m *ReverseConnectManager) Wait(ctx context.Context, endpointURL string, serverURIs []string) (net.Conn, error) {
 	if m == nil {
 		return nil, ua.BadConnectionClosed
@@ -164,8 +187,8 @@ func (m *ReverseConnectManager) Wait(ctx context.Context, endpointURL string, se
 		ctx, cancel = context.WithTimeout(ctx, m.waitTimeout)
 		defer cancel()
 	}
+	m.mu.Lock()
 	for {
-		m.mu.Lock()
 		if rc := m.takeLocked(endpointURL, serverURIs); rc != nil {
 			m.mu.Unlock()
 			return rc.conn, nil
@@ -173,19 +196,28 @@ func (m *ReverseConnectManager) Wait(ctx context.Context, endpointURL string, se
 		select {
 		case <-m.closing:
 			err := m.err
+			m.mu.Unlock()
 			if err == nil {
 				err = ua.BadConnectionClosed
 			}
-			m.mu.Unlock()
 			return nil, err
 		default:
 		}
 		notify := m.notify
+		m.waiters++
 		m.mu.Unlock()
+		var err error
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			err = ctx.Err()
 		case <-notify:
+		case <-m.closing:
+		}
+		m.mu.Lock()
+		m.waiters--
+		if err != nil {
+			m.mu.Unlock()
+			return nil, err
 		}
 	}
 }
@@ -202,52 +234,68 @@ func (m *ReverseConnectManager) serve() {
 				return
 			}
 		}
+		m.mu.Lock()
+		select {
+		case <-m.closing:
+			m.mu.Unlock()
+			conn.Close()
+			return
+		default:
+		}
+		if m.active >= m.maxPending {
+			m.mu.Unlock()
+			_ = writeReverseReject(conn, ua.BadTCPServerTooBusy)
+			conn.Close()
+			continue
+		}
+		m.active++
+		m.handshaking = append(m.handshaking, conn)
 		m.wg.Add(1)
-		go func() {
-			defer m.wg.Done()
-			m.handle(conn)
-		}()
+		m.mu.Unlock()
+		go m.handle(conn)
 	}
 }
 
 func (m *ReverseConnectManager) handle(conn net.Conn) {
-	serverURI, endpointURL, bufp, err := readReverseHello(conn, time.Now().Add(m.holdTime))
-	if bufp != nil {
-		defer reverseHelloBufferPool.Put(bufp)
-	}
-	if err != nil {
-		_ = writeReverseReject(conn, err)
-		conn.Close()
-		return
-	}
-	rc := &reverseConnection{
-		conn:        conn,
-		serverURI:   string(serverURI),
-		endpointURL: string(endpointURL),
+	defer m.wg.Done()
+	rc, err := readReverseHello(conn, time.Now().Add(min(m.holdTime, maxReverseHelloTimeout)))
+	if err == nil {
+		err = conn.SetReadDeadline(time.Time{})
 	}
 	m.mu.Lock()
-	select {
-	case <-m.closing:
+	tracked := removeConn(&m.handshaking, conn)
+	if err != nil || !tracked {
+		if tracked {
+			m.active--
+		}
 		m.mu.Unlock()
-		_ = writeReverseReject(conn, ua.BadTCPMessageTypeInvalid)
+		if code, ok := err.(ua.StatusCode); ok {
+			_ = writeReverseReject(conn, code)
+		}
 		conn.Close()
 		return
-	default:
 	}
+	rc.conn = conn
+	rc.timer = time.AfterFunc(m.holdTime, func() { m.expire(rc) })
 	m.pending = append(m.pending, rc)
 	m.notifyLocked()
-	holdTime := m.holdTime
 	m.mu.Unlock()
+}
 
-	timer := time.NewTimer(holdTime)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		if m.remove(rc) {
-			_ = writeReverseReject(conn, ua.BadTCPMessageTypeInvalid)
-			conn.Close()
+// expire closes a connection nobody claimed. Part 6 has the Client close, not reject, unwanted sockets.
+func (m *ReverseConnectManager) expire(rc *reverseConnection) {
+	m.mu.Lock()
+	removed := false
+	for i, pending := range m.pending {
+		if pending == rc {
+			m.removePendingLocked(i)
+			removed = true
+			break
 		}
-	case <-m.closing:
+	}
+	m.mu.Unlock()
+	if removed {
+		rc.conn.Close()
 	}
 }
 
@@ -263,34 +311,42 @@ func (m *ReverseConnectManager) fail(err error) {
 func (m *ReverseConnectManager) takeLocked(endpointURL string, serverURIs []string) *reverseConnection {
 	for i, rc := range m.pending {
 		if reverseConnectionMatches(rc, endpointURL, serverURIs) {
-			last := len(m.pending) - 1
-			m.pending[i] = m.pending[last]
-			m.pending[last] = nil
-			m.pending = m.pending[:last]
+			rc.timer.Stop()
+			m.removePendingLocked(i)
 			return rc
 		}
 	}
 	return nil
 }
 
-func (m *ReverseConnectManager) remove(rc *reverseConnection) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for i, pending := range m.pending {
-		if pending == rc {
-			last := len(m.pending) - 1
-			m.pending[i] = m.pending[last]
-			m.pending[last] = nil
-			m.pending = m.pending[:last]
+func (m *ReverseConnectManager) removePendingLocked(i int) {
+	last := len(m.pending) - 1
+	copy(m.pending[i:], m.pending[i+1:])
+	m.pending[last] = nil
+	m.pending = m.pending[:last]
+	m.active--
+}
+
+func (m *ReverseConnectManager) notifyLocked() {
+	if m.waiters == 0 {
+		return
+	}
+	close(m.notify)
+	m.notify = make(chan struct{})
+}
+
+func removeConn(conns *[]net.Conn, conn net.Conn) bool {
+	s := *conns
+	for i, c := range s {
+		if c == conn {
+			last := len(s) - 1
+			s[i] = s[last]
+			s[last] = nil
+			*conns = s[:last]
 			return true
 		}
 	}
 	return false
-}
-
-func (m *ReverseConnectManager) notifyLocked() {
-	close(m.notify)
-	m.notify = make(chan struct{})
 }
 
 func reverseConnectionMatches(rc *reverseConnection, endpointURL string, serverURIs []string) bool {
@@ -380,108 +436,60 @@ func getEndpointsReverse(ctx context.Context, request *ua.GetEndpointsRequest, m
 	return res, nil
 }
 
-func acceptReverse(ctx context.Context, ln net.Listener, endpointURL string, serverURIs []string, connectTimeout int64) (net.Conn, error) {
-	timeout := reverseConnectDuration(connectTimeout)
-	manager, err := newReverseConnectManager(
-		"",
-		ln,
-		WithReverseConnectHoldTime(timeout),
-		WithReverseConnectWaitTimeout(timeout),
-	)
+// readReverseHello reads a ReverseHello and copies both strings with one allocation.
+func readReverseHello(conn net.Conn, deadline time.Time) (*reverseConnection, error) {
+	_ = conn.SetReadDeadline(deadline)
+	bufp := reverseHelloBufferPool.Get().(*[]byte)
+	defer reverseHelloBufferPool.Put(bufp)
+	header := (*bufp)[:8]
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, err
+	}
+	if binary.LittleEndian.Uint32(header[:4]) != ua.MessageTypeReverseHello {
+		return nil, ua.BadTCPMessageTypeInvalid
+	}
+	msgLen := binary.LittleEndian.Uint32(header[4:8])
+	if msgLen < 16 {
+		return nil, ua.BadDecodingError
+	}
+	if msgLen > maxReverseHelloSize {
+		return nil, ua.BadTCPEndpointURLInvalid
+	}
+	buf := (*bufp)[8:msgLen]
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	n1, err := readReverseHelloStringLength(buf)
 	if err != nil {
 		return nil, err
 	}
-	defer manager.Close()
-	return manager.Wait(ctx, endpointURL, serverURIs)
+	n2, err := readReverseHelloStringLength(buf[4+n1:])
+	if err != nil {
+		return nil, err
+	}
+	s := string(buf[4 : 8+n1+n2])
+	return &reverseConnection{serverURI: s[:n1], endpointURL: s[n1+4:]}, nil
 }
 
-func validateReverseHello(conn net.Conn, endpointURL string, serverURIs []string, deadline time.Time) error {
-	serverURI, reverseEndpointURL, bufp, err := readReverseHello(conn, deadline)
-	if bufp != nil {
-		defer reverseHelloBufferPool.Put(bufp)
-	}
-	if err != nil {
-		return err
-	}
-	if !equalBytesString(reverseEndpointURL, endpointURL) {
-		return ua.BadTCPMessageTypeInvalid
-	}
-	if len(serverURIs) == 0 {
-		return nil
-	}
-	for _, expectedServerURI := range serverURIs {
-		if equalBytesString(serverURI, expectedServerURI) {
-			return nil
-		}
-	}
-	return ua.BadTCPMessageTypeInvalid
-}
-
-func readReverseHello(conn net.Conn, deadline time.Time) ([]byte, []byte, *[]byte, error) {
-	_ = conn.SetReadDeadline(deadline)
-	var header [8]byte
-	if _, err := io.ReadFull(conn, header[:]); err != nil {
-		return nil, nil, nil, err
-	}
-	if binary.LittleEndian.Uint32(header[:4]) != ua.MessageTypeReverseHello {
-		return nil, nil, nil, ua.BadTCPMessageTypeInvalid
-	}
-	msgLen := binary.LittleEndian.Uint32(header[4:8])
-	if msgLen < 16 || msgLen > defaultMaxBufferSize {
-		return nil, nil, nil, ua.BadDecodingError
-	}
-	bodyLen := int(msgLen - 8)
-	bufp := reverseHelloBufferPool.Get().(*[]byte)
-	buf := (*bufp)[:bodyLen]
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		reverseHelloBufferPool.Put(bufp)
-		return nil, nil, nil, err
-	}
-
-	serverURI, n, err := readReverseHelloString(buf)
-	if err != nil {
-		reverseHelloBufferPool.Put(bufp)
-		return nil, nil, nil, err
-	}
-	reverseEndpointURL, _, err := readReverseHelloString(buf[n:])
-	if err != nil {
-		reverseHelloBufferPool.Put(bufp)
-		return nil, nil, nil, err
-	}
-	return serverURI, reverseEndpointURL, bufp, nil
-}
-
-func readReverseHelloString(buf []byte) ([]byte, int, error) {
+// readReverseHelloStringLength returns the length of the String at the start of buf; null is empty.
+func readReverseHelloStringLength(buf []byte) (int, error) {
 	if len(buf) < 4 {
-		return nil, 0, ua.BadDecodingError
+		return 0, ua.BadDecodingError
 	}
 	n := int(int32(binary.LittleEndian.Uint32(buf[:4])))
 	if n < 0 {
-		return nil, 4, nil
+		n = 0
+	}
+	if n >= maxReverseHelloStringLength {
+		return 0, ua.BadTCPEndpointURLInvalid
 	}
 	if n > len(buf)-4 {
-		return nil, 0, ua.BadDecodingError
+		return 0, ua.BadDecodingError
 	}
-	return buf[4 : 4+n], 4 + n, nil
+	return n, nil
 }
 
-func equalBytesString(value []byte, expected string) bool {
-	if len(value) != len(expected) {
-		return false
-	}
-	for i, b := range value {
-		if expected[i] != b {
-			return false
-		}
-	}
-	return true
-}
-
-func writeReverseReject(conn net.Conn, reason error) error {
-	code, ok := reason.(ua.StatusCode)
-	if !ok {
-		code = ua.BadTCPMessageTypeInvalid
-	}
+func writeReverseReject(conn net.Conn, code ua.StatusCode) error {
 	bufp := reverseRejectBufferPool.Get().(*[16]byte)
 	defer reverseRejectBufferPool.Put(bufp)
 	buf := bufp[:]

@@ -237,6 +237,80 @@ func TestReverseConnectWithSharedManager(t *testing.T) {
 	}
 }
 
+func TestReverseConnectSurvivesHoldTime(t *testing.T) {
+	serverURL := freeEndpointURL(t)
+	reverseURL := freeEndpointURL(t)
+	srv := startReverseTestServer(t, serverURL, reverseURL, 25*time.Millisecond)
+	defer srv()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ch, err := client.Dial(
+		ctx,
+		serverURL,
+		client.WithReverseConnectURL(reverseURL),
+		client.WithInsecureSkipVerify(),
+		client.WithConnectTimeout(200),
+	)
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error connecting to server by reverse connect"))
+	}
+	defer ch.Abort(ctx)
+
+	time.Sleep(500 * time.Millisecond)
+	req := &ua.ReadRequest{NodesToRead: []ua.ReadValueID{{NodeID: ua.VariableIDServerServerStatusCurrentTime, AttributeID: ua.AttributeIDValue}}}
+	if _, err := ch.Read(ctx, req); err != nil {
+		t.Fatal(errors.Wrap(err, "Error reading after reverse connect hold time"))
+	}
+}
+
+func TestReverseConnectSharedManagerKeepsSpareSocket(t *testing.T) {
+	serverURL := freeEndpointURL(t)
+	reverseURL := freeEndpointURL(t)
+	mgr, err := client.NewReverseConnectManager(reverseURL)
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error constructing reverse connect manager"))
+	}
+	defer mgr.Close()
+	// default 5s retry interval: only the spare socket rule makes these dials fast
+	srv := startReverseTestServer(t, serverURL, reverseURL, 0)
+	defer srv()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for i := 0; i < 2; i++ {
+		start := time.Now()
+		ch, err := client.Dial(ctx, serverURL, client.WithReverseConnectManager(mgr), client.WithInsecureSkipVerify())
+		if err != nil {
+			t.Fatal(errors.Wrapf(err, "Error connecting client %d", i))
+		}
+		defer ch.Abort(ctx)
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("client %d: expected waiting server socket, dial took %v", i, d)
+		}
+	}
+}
+
+func startReverseTestServer(t *testing.T, serverURL, reverseURL string, interval time.Duration) func() {
+	t.Helper()
+	srv, err := NewTestServerAt(serverURL, server.WithReverseConnectClientURLs([]string{reverseURL}, interval))
+	if err != nil {
+		t.Fatal(errors.Wrap(err, "Error constructing reverse connect server"))
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+	return func() {
+		if err := srv.Close(); err != nil {
+			t.Error(errors.Wrap(err, "Error closing reverse connect server"))
+		}
+		if err := <-errCh; err != ua.BadServerHalted {
+			t.Error(errors.Wrap(err, "Error stopping reverse connect server"))
+		}
+	}
+}
+
 func TestReverseConnectURLAndManagerAreMutuallyExclusive(t *testing.T) {
 	reverseURL := freeEndpointURL(t)
 	mgr, err := client.NewReverseConnectManager(reverseURL)

@@ -63,13 +63,12 @@ type Server struct {
 	maxMessageSize                       uint32
 	maxChunkCount                        uint32
 	maxWorkerThreads                     int
-	reverseConnectURLs                   []string
+	reverseConnectTargets                []reverseConnectTarget
 	reverseConnectInterval               time.Duration
 	reverseConnectTimeout                time.Duration
 	reverseConnectRejectTimeout          time.Duration
 	reverseConnectMu                     sync.Mutex
-	reverseConnectActive                 map[string]int
-	reverseConnectRejectedUntil          map[string]time.Time
+	reverseConnectKick                   chan struct{}
 	serverDiagnostics                    bool
 	trace                                bool
 	localCertificate                     []byte
@@ -120,8 +119,7 @@ func New(localDescription ua.ApplicationDescription, certPath, keyPath, endpoint
 		reverseConnectInterval:             5 * time.Second,
 		reverseConnectTimeout:              3 * time.Second,
 		reverseConnectRejectTimeout:        time.Minute,
-		reverseConnectActive:               make(map[string]int),
-		reverseConnectRejectedUntil:        make(map[string]time.Time),
+		reverseConnectKick:                 make(chan struct{}, 1),
 		serverDiagnostics:                  true,
 		trace:                              false,
 		closing:                            make(chan struct{}),
@@ -310,6 +308,10 @@ func (srv *Server) ListenAndServe() error {
 		return ua.BadTCPEndpointURLInvalid
 	}
 
+	if len(srv.reverseConnectTargets) > 0 && !validReverseHelloStrings(srv.localDescription.ApplicationURI, srv.endpointURL) {
+		return ua.BadTCPEndpointURLInvalid
+	}
+
 	ln, err := net.Listen("tcp", ":"+baseURL.Port())
 	if err != nil {
 		// log.Printf("Error opening secure channel listener. %s\n", err.Error())
@@ -323,7 +325,7 @@ func (srv *Server) ListenAndServe() error {
 
 	var wg sync.WaitGroup
 	var reverseDone chan struct{}
-	if len(srv.reverseConnectURLs) > 0 {
+	if len(srv.reverseConnectTargets) > 0 {
 		reverseDone = make(chan struct{})
 		go func() {
 			srv.reverseConnect(&wg)
@@ -436,31 +438,35 @@ func (srv *Server) handleConnection(conn net.Conn, wg *sync.WaitGroup) {
 	// log.Printf("Success closing secure channel '%d'.\n", ch.channelID)
 }
 
-func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup, clientURL string) {
-	defer conn.Close()
+func (srv *Server) handleReverseConnection(conn net.Conn, wg *sync.WaitGroup, t *reverseConnectTarget) {
 	defer wg.Done()
-	defer srv.endReverseConnect(clientURL)
+	defer conn.Close()
+	established := false
+	defer func() { srv.endReverseConnect(t, established) }()
 	ch := newServerSecureChannel(srv, conn, srv.trace)
 	closing := make(chan struct{})
 	defer close(closing)
 	go func() {
 		select {
 		case <-srv.closing:
-			ch.Close()
+			// ch.Close would block on the lock Open holds while waiting for Hello.
+			conn.Close()
 		case <-closing:
 		}
 	}()
 	if err := ch.writeReverseHello(); err != nil {
 		return
 	}
-	err := ch.Open()
-	if err != nil {
-		srv.rejectReverseConnect(clientURL, err)
-		if c, ok := err.(ua.StatusCode); ok {
+	if err := ch.Open(); err != nil {
+		if _, ok := err.(remoteError); ok {
+			srv.rejectReverseConnect(t, time.Now())
+		} else if c, ok := err.(ua.StatusCode); ok {
 			ch.Abort(c, "")
 		}
 		return
 	}
+	established = true
+	srv.establishReverseConnect(t)
 	_ = srv.requestWorker(ch)
 }
 

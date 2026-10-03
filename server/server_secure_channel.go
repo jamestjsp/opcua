@@ -180,21 +180,28 @@ func (ch *serverSecureChannel) IsExpired() bool {
 }
 
 func (ch *serverSecureChannel) writeReverseHello() error {
-	buf := *(ch.bytesPool.Get().(*[]byte))
-	defer ch.bytesPool.Put(&buf)
-	writer := ua.NewWriter(buf)
-	enc := ua.NewBinaryEncoder(writer, ua.NewEncodingContext())
 	serverURI := ch.srv.localDescription.ApplicationURI
-	enc.WriteUInt32(ua.MessageTypeReverseHello)
-	enc.WriteUInt32(uint32(16 + len(serverURI) + len(ch.srv.endpointURL)))
-	enc.WriteString(serverURI)
-	enc.WriteString(ch.srv.endpointURL)
-	ch.conn.SetWriteDeadline(time.Now().Add(3000 * time.Millisecond))
-	if _, err := ch.write(writer.Bytes()); err != nil {
-		return ua.BadEncodingError
+	endpointURL := ch.srv.endpointURL
+	n := 16 + len(serverURI) + len(endpointURL)
+	bufp := ch.bytesPool.Get().(*[]byte)
+	defer ch.bytesPool.Put(bufp)
+	var b []byte
+	if len(*bufp) >= n {
+		b = (*bufp)[:n]
+	} else {
+		b = make([]byte, n)
 	}
-	ch.conn.SetWriteDeadline(time.Time{})
-	return nil
+	binary.LittleEndian.PutUint32(b[0:4], ua.MessageTypeReverseHello)
+	binary.LittleEndian.PutUint32(b[4:8], uint32(n))
+	binary.LittleEndian.PutUint32(b[8:12], uint32(len(serverURI)))
+	off := 12 + copy(b[12:], serverURI)
+	binary.LittleEndian.PutUint32(b[off:off+4], uint32(len(endpointURL)))
+	copy(b[off+4:], endpointURL)
+	ch.conn.SetWriteDeadline(time.Now().Add(3000 * time.Millisecond))
+	if _, err := ch.write(b); err != nil {
+		return err
+	}
+	return ch.conn.SetWriteDeadline(time.Time{})
 }
 
 // Open the secure channel to the remote endpoint.
@@ -258,11 +265,7 @@ func (ch *serverSecureChannel) Open() error {
 		if err := dec.ReadUInt32(&remoteCode); err != nil {
 			return ua.BadDecodingError
 		}
-		var unused string
-		if err = dec.ReadString(&unused); err != nil {
-			return ua.BadDecodingError
-		}
-		return ua.StatusCode(remoteCode)
+		return remoteError(remoteCode)
 
 	default:
 		return ua.BadDecodingError

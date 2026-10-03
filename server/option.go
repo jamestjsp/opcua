@@ -3,6 +3,7 @@
 package server
 
 import (
+	"net/url"
 	"time"
 
 	"github.com/awcullen/opcua/ua"
@@ -102,10 +103,19 @@ func WithMaxWorkerThreads(value int) Option {
 }
 
 // WithReverseConnectClientURLs sets the client URLs that the server connects to for reverse connections.
-// The interval controls how often the server retries the configured client URLs.
+// The URLs are in the form opc.tcp://[host]:[port].
+// The interval controls how often the server retries client URLs without a waiting socket.
 func WithReverseConnectClientURLs(urls []string, interval time.Duration) Option {
 	return func(srv *Server) error {
-		srv.reverseConnectURLs = append(srv.reverseConnectURLs[:0], urls...)
+		targets := make([]reverseConnectTarget, len(urls))
+		for i, clientURL := range urls {
+			u, err := url.Parse(clientURL)
+			if err != nil || u.Host == "" {
+				return ua.BadTCPEndpointURLInvalid
+			}
+			targets[i] = reverseConnectTarget{host: u.Host}
+		}
+		srv.reverseConnectTargets = targets
 		if interval > 0 {
 			srv.reverseConnectInterval = interval
 		}

@@ -218,8 +218,9 @@ func WithConnectTimeout(value int64) Option {
 	}
 }
 
-// WithReverseConnectURL listens at the given client URL and waits for the server to initiate the TCP connection.
+// WithReverseConnectURL listens at the given client URL during Dial and waits for the server to initiate the TCP connection.
 // The URL is in the form opc.tcp://[host]:[port].
+// The listener closes when Dial returns; use WithReverseConnectManager to keep it open across dials.
 func WithReverseConnectURL(value string) Option {
 	return func(c *Client) error {
 		c.reverseConnectURL = value
